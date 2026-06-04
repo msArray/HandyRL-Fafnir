@@ -1,9 +1,6 @@
 
 env_args:
-    env: 'TicTacToe'
-    #env: 'Geister'
-    #env: 'HungryGeese'
-    #env: 'handyrl.envs.parallel_tictactoe'  # specify by path
+    env: 'fafnir_env'
 
 train_args:
     turn_based_training: True
