@@ -5,24 +5,24 @@ env_args:
 train_args:
     turn_based_training: True
     observation: False
-    gamma: 0.8
-    forward_steps: 16
-    burn_in_steps: 0  # for RNNs
+    gamma: 0.97
+    forward_steps: 32
     compress_steps: 4
-    entropy_regularization: 1.0e-1
+    burn_in_steps: 0  # for RNNs
+    entropy_regularization: 5.0e-3
     entropy_regularization_decay: 0.1
     update_episodes: 200
-    batch_size: 128
-    minimum_episodes: 400
-    maximum_episodes: 100000
+    batch_size: 256
+    minimum_episodes: 6000
+    maximum_episodes: 200000
     epochs: -1
     num_batchers: 2
     eval_rate: 0.1
     worker:
-        num_parallel: 6
+        num_parallel: 32
     lambda: 0.7
-    policy_target: 'TD' # 'UPGO' 'VTRACE' 'TD' 'MC'
-    value_target: 'TD' # 'VTRACE' 'TD' 'MC'
+    policy_target: 'VTRACE' # 'UPGO' 'VTRACE' 'TD' 'MC'
+    value_target: 'VTRACE' # 'VTRACE' 'TD' 'MC'
     eval:
         opponent: ['random']
     seed: 0
@@ -31,5 +31,5 @@ train_args:
 
 worker_args:
     server_address: ''
-    num_parallel: 8
+    num_parallel: 32
 

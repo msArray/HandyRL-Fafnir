@@ -100,6 +100,10 @@ class Environment(BaseEnvironment):
         self.win_player = None
         self.record = []
         
+        # Track scores for immediate reward calculation
+        self.prev_scores = [0, 0]
+        self.rewards = {0: 0.0, 1: 0.0}
+        
         self.deal_initial_hands()
         self.seed_trash_at_round_start()
         self.setup_offer()
@@ -235,6 +239,13 @@ class Environment(BaseEnvironment):
             self.current_player = 1
         else:
             self.resolve_auction()
+            
+        # Calculate immediate rewards (score differences scaled by 40.0)
+        self.rewards = {
+            0: (self.players_state[0]["score"] - self.prev_scores[0]) / 40.0,
+            1: (self.players_state[1]["score"] - self.prev_scores[1]) / 40.0
+        }
+        self.prev_scores = [self.players_state[0]["score"], self.players_state[1]["score"]]
 
     def resolve_auction(self):
         bids_p0 = self.bids[0]
@@ -311,6 +322,9 @@ class Environment(BaseEnvironment):
             else:
                 outcomes[p] = -1
         return outcomes
+
+    def reward(self):
+        return self.rewards
 
     def legal_actions(self, player=None):
         if player is None:
