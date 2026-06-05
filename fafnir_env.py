@@ -36,6 +36,75 @@ def generate_action_map(max_size=5):
 
 ACTION_TO_ID, ID_TO_ACTION = generate_action_map(5)
 
+# =========================
+# Numba Accelerated Helpers
+# =========================
+from numba import njit
+
+COLOR_TO_INT = {c: i for i, c in enumerate(COLORS_ALL)}
+
+# Precompute color counts for all 462 actions (shape: 462, 6)
+ACTION_COUNTS = np.zeros((462, 6), dtype=np.int32)
+for i in range(462):
+    action_tuple = ID_TO_ACTION[i]
+    for color in action_tuple:
+        ACTION_COUNTS[i, COLOR_TO_INT[color]] += 1
+
+@njit(cache=True)
+def get_legal_actions_numba(action_counts_matrix, hand_counts, offer_counts):
+    n_legal = 0
+    for i in range(462):
+        # 1. Check offer collision
+        collision = False
+        for c in range(6):
+            if action_counts_matrix[i, c] > 0 and offer_counts[c] > 0:
+                collision = True
+                break
+        if collision:
+            continue
+            
+        # 2. Check hand sufficiency
+        possible = True
+        for c in range(6):
+            if hand_counts[c] < action_counts_matrix[i, c]:
+                possible = False
+                break
+        if possible:
+            n_legal += 1
+            
+    legal_ids = np.empty(n_legal, dtype=np.int32)
+    idx = 0
+    for i in range(462):
+        collision = False
+        for c in range(6):
+            if action_counts_matrix[i, c] > 0 and offer_counts[c] > 0:
+                collision = True
+                break
+        if collision:
+            continue
+            
+        possible = True
+        for c in range(6):
+            if hand_counts[c] < action_counts_matrix[i, c]:
+                possible = False
+                break
+        if possible:
+            legal_ids[idx] = i
+            idx += 1
+            
+    return legal_ids
+
+def get_legal_actions(hand, offer):
+    hand_counts = np.zeros(6, dtype=np.int32)
+    for s in hand:
+        hand_counts[COLOR_TO_INT[s]] += 1
+        
+    offer_counts = np.zeros(6, dtype=np.int32)
+    for s in offer:
+        offer_counts[COLOR_TO_INT[s]] += 1
+        
+    return get_legal_actions_numba(ACTION_COUNTS, hand_counts, offer_counts).tolist()
+
 def is_legal(action_tuple, hand, offer):
     for color in action_tuple:
         if color in offer:
@@ -44,6 +113,7 @@ def is_legal(action_tuple, hand, offer):
         if hand.count(color) < action_tuple.count(color):
             return False
     return True
+
 
 # =========================
 # Neural Network Model
@@ -333,12 +403,8 @@ class Environment(BaseEnvironment):
         hand = self.players_state[player]["stones"]
         offer = self.offer
         
-        legal_ids = []
-        for action_id, action_tuple in self.id_to_action.items():
-            if is_legal(action_tuple, hand, offer):
-                legal_ids.append(action_id)
-        
-        return legal_ids
+        return get_legal_actions(hand, offer)
+
 
     def players(self):
         return [0, 1]

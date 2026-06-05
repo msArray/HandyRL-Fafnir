@@ -87,3 +87,26 @@ def test_environment_network(environment_path, env):
         traceback.print_exc()
 
     assert no_error_loop
+
+
+def test_fafnir_environment_local():
+    """Test battle loop of fafnir_env using local battle interface"""
+    no_error_loop = False
+    try:
+        import fafnir_env
+        e = fafnir_env.Environment()
+        for _ in range(100):
+            e.reset()
+            while not e.terminal():
+                actions = {}
+                for player in e.turns():
+                    actions[player] = random.choice(e.legal_actions(player))
+                e.step(actions)
+                e.reward()
+            e.outcome()
+        no_error_loop = True
+    except Exception:
+        traceback.print_exc()
+
+    assert no_error_loop
+

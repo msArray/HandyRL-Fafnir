@@ -2,3 +2,5 @@
 *.pyc
 *.pth
 *.onnx
+__pycache__
+.gemini

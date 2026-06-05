@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import socketio
 
-from fafnir_env import FafnirModel, ID_TO_ACTION, is_legal, COLORS_ALL
+from fafnir_env import FafnirModel, ID_TO_ACTION, is_legal, COLORS_ALL, get_legal_actions
 
 sio = socketio.AsyncClient(reconnection=True, ssl_verify=False)
 
@@ -164,10 +164,7 @@ async def do_submit_bid(st: Dict[str, Any], reason: str):
         policy_logits = outputs['policy'].squeeze(0).numpy()
         
     # 3. Mask illegal actions
-    legal_indices = []
-    for action_id, action_tuple in ID_TO_ACTION.items():
-        if is_legal(action_tuple, hand, offer):
-            legal_indices.append(action_id)
+    legal_indices = get_legal_actions(hand, offer)
             
     if not legal_indices:
         # Fallback to empty bid if somehow no actions are legal (should not happen as empty is always legal)
