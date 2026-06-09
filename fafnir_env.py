@@ -15,6 +15,7 @@ COLORS = ["red", "orange", "yellow", "green", "blue"]  # priority order for tie-
 GOLD = "gold"
 COLORS_ALL = ["gold", "red", "orange", "yellow", "green", "blue"]
 STONE_COUNT = {GOLD: 20, "red": 12, "orange": 12, "yellow": 12, "green": 12, "blue": 12}
+OBS_SIZE = 34
 
 TRASH_LIMIT = 6
 SEED_TRASH_AT_ROUND_START = 3
@@ -121,8 +122,8 @@ def is_legal(action_tuple, hand, offer):
 class FafnirModel(nn.Module):
     def __init__(self):
         super().__init__()
-        # Input size: 26 features
-        self.fc1 = nn.Linear(26, 128)
+        # Input size: 34 features
+        self.fc1 = nn.Linear(OBS_SIZE, 128)
         self.fc2 = nn.Linear(128, 128)
         self.fc3 = nn.Linear(128, 128)
         
@@ -166,6 +167,7 @@ class Environment(BaseEnvironment):
         self.caretaker = random.randint(0, 1)
         self.current_player = 0
         self.bids = {0: [], 1: []}
+        self.known_stones = [self.empty_color_counts(), self.empty_color_counts()]
         
         self.win_player = None
         self.record = []
@@ -179,6 +181,15 @@ class Environment(BaseEnvironment):
         self.setup_offer()
         
         return None
+
+    def empty_color_counts(self):
+        return {c: 0 for c in COLORS_ALL}
+
+    def count_stones(self, stones):
+        counts = self.empty_color_counts()
+        for s in stones:
+            counts[s] += 1
+        return counts
 
     def make_bag(self):
         bag = []
@@ -269,6 +280,43 @@ class Environment(BaseEnvironment):
             adds.append(score)
         return ranked, adds
 
+    def compute_public_potential_score(self, player):
+        opponent = 1 - player
+        totals = {c: self.players_state[player]["stones"].count(c) for c in COLORS}
+        for c in COLORS:
+            totals[c] += self.known_stones[opponent][c]
+        ranked = sorted(totals.items(), key=lambda x: (-x[1], COLORS.index(x[0])))
+        first = ranked[0][0] if ranked else None
+        second = ranked[1][0] if len(ranked) > 1 else None
+
+        score = self.players_state[player]["stones"].count(GOLD)
+        for c in COLORS:
+            cnt = self.players_state[player]["stones"].count(c)
+            if cnt == 0 or cnt >= 5:
+                continue
+            if c == first:
+                score += cnt * 3
+            elif c == second:
+                score += cnt * 2
+            else:
+                score -= cnt
+        return score
+
+    def update_known_stones_after_auction(self, winner, loser, winner_bid, loser_bid, offer):
+        winner_bid_counts = self.count_stones(winner_bid)
+        loser_bid_counts = self.count_stones(loser_bid)
+        offer_counts = self.count_stones(offer)
+
+        for c in COLORS_ALL:
+            self.known_stones[winner][c] = max(
+                0,
+                self.known_stones[winner][c] + offer_counts[c] - winner_bid_counts[c],
+            )
+            self.known_stones[loser][c] = max(
+                self.known_stones[loser][c],
+                loser_bid_counts[c],
+            )
+
     def process_round_end(self):
         ranked, adds = self.compute_round_scores()
         for i, add in enumerate(adds):
@@ -285,6 +333,7 @@ class Environment(BaseEnvironment):
         self.deal_initial_hands()
         self.seed_trash_at_round_start()
         self.setup_offer()
+        self.known_stones = [self.empty_color_counts(), self.empty_color_counts()]
         
         self.round += 1
         self.turn_num = 1
@@ -320,6 +369,7 @@ class Environment(BaseEnvironment):
     def resolve_auction(self):
         bids_p0 = self.bids[0]
         bids_p1 = self.bids[1]
+        current_offer = self.offer[:]
         
         bids_count = [len(bids_p0), len(bids_p1)]
         max_bid = max(bids_count)
@@ -343,6 +393,7 @@ class Environment(BaseEnvironment):
                     winner = min(candidates)
             
             used = self.bids[winner]
+            loser = 1 - winner
             for s in used:
                 try:
                     self.players_state[winner]["stones"].remove(s)
@@ -357,6 +408,13 @@ class Environment(BaseEnvironment):
             
             self.players_state[winner]["score"] += POINT_CHIP
             self.caretaker = winner
+            self.update_known_stones_after_auction(
+                winner,
+                loser,
+                self.bids[winner],
+                self.bids[loser],
+                current_offer,
+            )
             
         self.bids = {0: [], 1: []}
         
@@ -415,37 +473,47 @@ class Environment(BaseEnvironment):
         opponent = 1 - player
         
         my_hand = self.players_state[player]["stones"]
-        my_hand_counts = [my_hand.count(c) for c in COLORS_ALL]
+        my_hand_counts = [
+            my_hand.count(c) / float(STONE_COUNT[c])
+            for c in COLORS_ALL
+        ]
         
-        opp_hand_size = len(self.players_state[opponent]["stones"])
+        opp_known_counts = [
+            self.known_stones[opponent][c] / float(STONE_COUNT[c])
+            for c in COLORS_ALL
+        ]
+        opp_unknown_size = max(
+            0,
+            len(self.players_state[opponent]["stones"]) - sum(self.known_stones[opponent].values()),
+        )
         
-        offer_counts = [self.offer.count(c) for c in COLORS_ALL]
+        my_known_counts = [
+            self.known_stones[player][c] / float(STONE_COUNT[c])
+            for c in COLORS_ALL
+        ]
+        
+        offer_counts = [self.offer.count(c) / 10.0 for c in COLORS_ALL]
         
         trash_counts = [self.trash[c] for c in COLORS_ALL]
         
         bag_size = len(self.bag)
         
-        my_score = self.players_state[player]["score"]
-        opp_score = self.players_state[opponent]["score"]
-        
         is_caretaker = 1.0 if self.caretaker == player else 0.0
-        is_p0 = 1.0 if player == 0 else 0.0
+        potential_score = self.compute_public_potential_score(player)
         
         features = (
             my_hand_counts + 
-            [opp_hand_size / 20.0] + 
             offer_counts + 
             [tc / 6.0 for tc in trash_counts] + 
+            opp_known_counts +
+            [opp_unknown_size / 20.0] +
+            my_known_counts +
             [bag_size / 80.0, 
-             my_score / 40.0, 
-             opp_score / 40.0, 
              is_caretaker, 
-             is_p0, 
-             self.turn_num / 20.0, 
-             self.round / 10.0]
+             (potential_score + 15.0) / 75.0]
         )
         
-        return np.array(features, dtype=np.float32)
+        return np.clip(np.array(features, dtype=np.float32), 0.0, 1.0)
 
     def action2str(self, action_id, player=None):
         action_tuple = self.id_to_action[action_id]

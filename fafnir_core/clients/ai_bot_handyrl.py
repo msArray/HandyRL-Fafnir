@@ -13,7 +13,14 @@ import numpy as np
 import torch
 import socketio
 
-from fafnir_env import FafnirModel, ID_TO_ACTION, is_legal, COLORS_ALL, get_legal_actions
+from fafnir_env import (
+    FafnirModel,
+    ID_TO_ACTION,
+    COLORS,
+    COLORS_ALL,
+    STONE_COUNT,
+    get_legal_actions,
+)
 
 sio = socketio.AsyncClient(reconnection=True, ssl_verify=False)
 
@@ -21,6 +28,9 @@ cfg = {"room": "room1", "name": "AI_HandyRL", "url": "http://127.0.0.1:8765"}
 
 my_index: Optional[int] = None
 last_state: Optional[Dict[str, Any]] = None
+known_stones = [{c: 0 for c in COLORS_ALL}, {c: 0 for c in COLORS_ALL}]
+known_round: Optional[int] = None
+known_result_key: Optional[str] = None
 
 # AI neural network model
 model: Optional[FafnirModel] = None
@@ -42,6 +52,90 @@ def _loop_time() -> float:
 
 def safe_list(x: Any) -> List[Any]:
     return x if isinstance(x, list) else []
+
+
+def empty_color_counts() -> Dict[str, int]:
+    return {c: 0 for c in COLORS_ALL}
+
+
+def count_stones(stones: List[Any]) -> Dict[str, int]:
+    counts = empty_color_counts()
+    for s in stones:
+        if s in counts:
+            counts[s] += 1
+    return counts
+
+
+def public_potential_score(hand: List[str], opponent_known: Dict[str, int]) -> int:
+    totals = {c: hand.count(c) + int(opponent_known.get(c, 0)) for c in COLORS}
+    ranked = sorted(totals.items(), key=lambda x: (-x[1], COLORS.index(x[0])))
+    first = ranked[0][0] if ranked else None
+    second = ranked[1][0] if len(ranked) > 1 else None
+
+    score = hand.count("gold")
+    for c in COLORS:
+        cnt = hand.count(c)
+        if cnt == 0 or cnt >= 5:
+            continue
+        if c == first:
+            score += cnt * 3
+        elif c == second:
+            score += cnt * 2
+        else:
+            score -= cnt
+    return score
+
+
+def update_known_stones_from_state(st: Dict[str, Any]):
+    global known_stones, known_round, known_result_key
+
+    try:
+        round_num = int(st.get("round", 1))
+    except Exception:
+        round_num = 1
+    if known_round != round_num:
+        known_stones = [empty_color_counts(), empty_color_counts()]
+        known_round = round_num
+        known_result_key = None
+
+    lr = st.get("last_result") or {}
+    if not isinstance(lr, dict):
+        return
+
+    winner = lr.get("winner")
+    loser = lr.get("loser")
+    try:
+        winner = int(winner)
+        loser = int(loser)
+    except Exception:
+        return
+    if winner not in (0, 1) or loser not in (0, 1):
+        return
+
+    winner_bid = safe_list(lr.get("winner_bid"))
+    loser_bid = safe_list(lr.get("loser_bid"))
+    offer = safe_list(lr.get("offer"))
+    result_key = (
+        f"{round_num}:{winner}:{loser}:"
+        f"{tuple(winner_bid)}:{tuple(loser_bid)}:{tuple(offer)}:{lr.get('bids_count')}"
+    )
+    if known_result_key == result_key:
+        return
+
+    if not winner_bid and not loser_bid:
+        known_result_key = result_key
+        return
+
+    winner_bid_counts = count_stones(winner_bid)
+    loser_bid_counts = count_stones(loser_bid)
+    offer_counts = count_stones(offer)
+    for c in COLORS_ALL:
+        known_stones[winner][c] = max(
+            0,
+            known_stones[winner][c] + offer_counts[c] - winner_bid_counts[c],
+        )
+        known_stones[loser][c] = max(known_stones[loser][c], loser_bid_counts[c])
+    known_result_key = result_key
 
 
 def phase_of(st: Dict[str, Any]) -> str:
@@ -106,44 +200,39 @@ def _phase_key(st: Dict[str, Any]) -> str:
 def state_to_observation(st: Dict[str, Any], my_idx: int) -> np.ndarray:
     # Extract details safely
     hand = my_hand(st)
-    my_hand_counts = [hand.count(c) for c in COLORS_ALL]
+    my_hand_counts = [hand.count(c) / float(STONE_COUNT[c]) for c in COLORS_ALL]
     
     opp_idx = 1 - my_idx
     ps = players_of(st)
     opp_hand_size = ps[opp_idx].get("hand_count", 0) if opp_idx < len(ps) else 0
+    opp_known = known_stones[opp_idx]
+    my_known = known_stones[my_idx]
     
     offer = safe_list(st.get("offer"))
-    offer_counts = [offer.count(c) for c in COLORS_ALL]
+    offer_counts = [offer.count(c) / 10.0 for c in COLORS_ALL]
     
     trash = st.get("trash") or {}
     trash_counts = [trash.get(c, 0) for c in COLORS_ALL]
     
     bag_size = st.get("bag_left", 0)
-    
-    my_score = ps[my_idx].get("score", 0) if my_idx < len(ps) else 0
-    opp_score = ps[opp_idx].get("score", 0) if opp_idx < len(ps) else 0
-    
+
     caretaker = st.get("caretaker", 0)
     is_caretaker = 1.0 if caretaker == my_idx else 0.0
-    is_p0 = 1.0 if my_idx == 0 else 0.0
-    
-    turn_num = st.get("turn", 1)
-    round_num = st.get("round", 1)
+    opp_unknown_size = max(0, int(opp_hand_size or 0) - sum(opp_known.values()))
+    potential_score = public_potential_score(hand, opp_known)
     
     features = (
         my_hand_counts + 
-        [opp_hand_size / 20.0] + 
         offer_counts + 
         [tc / 6.0 for tc in trash_counts] + 
+        [opp_known[c] / float(STONE_COUNT[c]) for c in COLORS_ALL] +
+        [opp_unknown_size / 20.0] +
+        [my_known[c] / float(STONE_COUNT[c]) for c in COLORS_ALL] +
         [bag_size / 80.0, 
-         my_score / 40.0, 
-         opp_score / 40.0, 
          is_caretaker, 
-         is_p0, 
-         turn_num / 20.0, 
-         round_num / 10.0]
+         (potential_score + 15.0) / 75.0]
     )
-    return np.array(features, dtype=np.float32)
+    return np.clip(np.array(features, dtype=np.float32), 0.0, 1.0)
 
 
 async def do_submit_bid(st: Dict[str, Any], reason: str):
@@ -247,6 +336,7 @@ async def player_assigned(data):
 async def state_update(state):
     global last_state, _ok_sent_key
     last_state = state
+    update_known_stones_from_state(state)
 
     # reset OK debounce when leaving RESULT/ROUND_END
     ph = phase_of(state)
