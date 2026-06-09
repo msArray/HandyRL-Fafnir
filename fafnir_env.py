@@ -22,6 +22,7 @@ SEED_TRASH_AT_ROUND_START = 3
 
 POINT_CHIP = 1
 SCORE_TO_WIN = 40
+ACTION_TAX_SCALE = 0.002
 
 # =========================
 # Action Space Mapping
@@ -317,6 +318,10 @@ class Environment(BaseEnvironment):
                 loser_bid_counts[c],
             )
 
+    def action_tax(self, action_tuple):
+        bid_size = len(action_tuple)
+        return -(bid_size * bid_size) * ACTION_TAX_SCALE
+
     def process_round_end(self):
         ranked, adds = self.compute_round_scores()
         for i, add in enumerate(adds):
@@ -353,6 +358,8 @@ class Environment(BaseEnvironment):
         self.record.append(action_id)
         action_tuple = self.id_to_action[action_id]
         self.bids[player] = list(action_tuple)
+        acting_player = player
+        action_tax = self.action_tax(action_tuple)
         
         if player == 0:
             self.current_player = 1
@@ -364,6 +371,7 @@ class Environment(BaseEnvironment):
             0: (self.players_state[0]["score"] - self.prev_scores[0]) / 40.0,
             1: (self.players_state[1]["score"] - self.prev_scores[1]) / 40.0
         }
+        self.rewards[acting_player] += action_tax
         self.prev_scores = [self.players_state[0]["score"], self.players_state[1]["score"]]
 
     def resolve_auction(self):
