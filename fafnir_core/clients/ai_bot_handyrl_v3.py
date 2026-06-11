@@ -1,9 +1,11 @@
-# fafnir_core/clients/ai_bot_handyrl.py
+# fafnir_core/clients/ai_bot_handyrl_v3.py
 import asyncio
 import argparse
 import random
 import sys
 import os
+import time
+import copy
 from typing import Any, Dict, List, Optional
 
 # Add workspace root to sys.path so we can import fafnir_env
@@ -14,8 +16,10 @@ import torch
 import socketio
 
 from fafnir_env import (
+    Environment,
     FafnirModel,
     ID_TO_ACTION,
+    ACTION_TO_ID,
     COLORS,
     COLORS_ALL,
     STONE_COUNT,
@@ -24,7 +28,7 @@ from fafnir_env import (
 
 sio = socketio.AsyncClient(reconnection=True, ssl_verify=False)
 
-cfg = {"room": "room1", "name": "AI_HandyRL", "url": "http://127.0.0.1:8765"}
+cfg = {"room": "room1", "name": "AI_HandyRL_V3", "url": "http://127.0.0.1:8765"}
 
 my_index: Optional[int] = None
 last_state: Optional[Dict[str, Any]] = None
@@ -43,7 +47,8 @@ _last_emit_ts = 0.0
 _ok_sent_key: Optional[str] = None
 
 AUTO_NEXT = True
-THINK_DELAY = 0.001
+THINK_TIME = 0.2  # Dynamic thinking time budget in seconds
+WEIGHT = 0.5      # Weight for simulated value head
 
 
 def _loop_time() -> float:
@@ -197,6 +202,117 @@ def _phase_key(st: Dict[str, Any]) -> str:
     return f"{ph}:r{r}:t{t}"
 
 
+def sample_environment(st: Dict[str, Any], my_idx: int, known_stones_list: List[Dict[str, int]]) -> Environment:
+    env = Environment()
+    opp_idx = 1 - my_idx
+
+    # 1. Gather known stones
+    my_h = my_hand(st)
+    offer = safe_list(st.get("offer"))
+    trash = st.get("trash") or {}
+
+    # Opponent's known hand
+    opp_k = known_stones_list[opp_idx]
+    opp_k_list = []
+    for c, cnt in opp_k.items():
+        opp_k_list.extend([c] * cnt)
+
+    # Accumulate all known stones in play/discarded
+    all_known = {c: 0 for c in COLORS_ALL}
+    for c in my_h:
+        all_known[c] += 1
+    for c in offer:
+        all_known[c] += 1
+    for c, cnt in trash.items():
+        all_known[c] += cnt
+    for c in opp_k_list:
+        all_known[c] += 1
+
+    # 2. Reconstruct the unknown stones pool
+    pool = []
+    for c, total_limit in STONE_COUNT.items():
+        remaining = total_limit - all_known[c]
+        if remaining > 0:
+            pool.extend([c] * remaining)
+
+    # Opponent's hidden hand size
+    ps = players_of(st)
+    opp_hand_size = ps[opp_idx].get("hand_count", 0) if opp_idx < len(ps) else 0
+    opp_unknown_size = max(0, opp_hand_size - len(opp_k_list))
+
+    # Sample opponent's unknown stones
+    random.shuffle(pool)
+    opp_sampled_hand = opp_k_list.copy()
+    if opp_unknown_size > 0:
+        sampled = pool[:opp_unknown_size]
+        opp_sampled_hand.extend(sampled)
+        pool = pool[opp_unknown_size:]
+
+    # Remaining stones form the bag
+    bag = pool
+    random.shuffle(bag)
+
+    # 3. Populate simulator state
+    env.bag = bag
+    env.trash = {c: trash.get(c, 0) for c in COLORS_ALL}
+    env.trash_pile = []
+    for c, cnt in env.trash.items():
+        env.trash_pile.extend([c] * cnt)
+
+    env.offer = offer.copy()
+
+    p0_hand = my_h if my_idx == 0 else opp_sampled_hand
+    p1_hand = my_h if my_idx == 1 else opp_sampled_hand
+
+    p0_score = ps[0].get("score", 0) if len(ps) > 0 else 0
+    p1_score = ps[1].get("score", 0) if len(ps) > 1 else 0
+
+    env.players_state = [
+        {"stones": p0_hand.copy(), "score": p0_score},
+        {"stones": p1_hand.copy(), "score": p1_score}
+    ]
+
+    try:
+        env.round = int(st.get("round", 1))
+        env.turn_num = int(st.get("turn", 1))
+    except Exception:
+        env.round = 1
+        env.turn_num = 1
+
+    env.caretaker = int(st.get("caretaker", 0))
+    env.current_player = my_idx
+    env.bids = {0: [], 1: []}
+    env.known_stones = [dict(known_stones_list[0]), dict(known_stones_list[1])]
+    env.win_player = None
+
+    # Track scores for immediate reward calculation
+    env.prev_scores = [p0_score, p1_score]
+    env.rewards = {0: 0.0, 1: 0.0}
+
+    return env
+
+
+def clone_env(env: Environment) -> Environment:
+    new_env = Environment()
+    new_env.bag = env.bag.copy()
+    new_env.trash = env.trash.copy()
+    new_env.trash_pile = env.trash_pile.copy()
+    new_env.offer = env.offer.copy()
+    new_env.players_state = [
+        {"stones": p["stones"].copy(), "score": p["score"]} for p in env.players_state
+    ]
+    new_env.round = env.round
+    new_env.turn_num = env.turn_num
+    new_env.caretaker = env.caretaker
+    new_env.current_player = env.current_player
+    new_env.bids = {0: env.bids[0].copy(), 1: env.bids[1].copy()}
+    new_env.known_stones = [env.known_stones[0].copy(), env.known_stones[1].copy()]
+    new_env.win_player = env.win_player
+    new_env.prev_scores = env.prev_scores.copy()
+    new_env.rewards = env.rewards.copy()
+    return new_env
+
+
 def state_to_observation(st: Dict[str, Any], my_idx: int) -> np.ndarray:
     # Extract details safely
     hand = my_hand(st)
@@ -216,8 +332,7 @@ def state_to_observation(st: Dict[str, Any], my_idx: int) -> np.ndarray:
     
     bag_size = st.get("bag_left", 0)
 
-    caretaker = st.get("caretaker", 0)
-    is_caretaker = 1.0 if caretaker == my_idx else 0.0
+    is_caretaker = 1.0 if st.get("caretaker", 0) == my_idx else 0.0
     opp_unknown_size = max(0, int(opp_hand_size or 0) - sum(opp_known.values()))
     potential_score = public_potential_score(hand, opp_known)
     
@@ -235,39 +350,126 @@ def state_to_observation(st: Dict[str, Any], my_idx: int) -> np.ndarray:
     return np.clip(np.array(features, dtype=np.float32), 0.0, 1.0)
 
 
+def select_action_with_search(st: Dict[str, Any], my_idx: int, think_time: float) -> List[str]:
+    hand = my_hand(st)
+    offer = safe_list(st.get("offer"))
+    legal_action_ids = get_legal_actions(hand, offer)
+
+    if not legal_action_ids:
+        return []
+
+    # If only one legal move exists, return it immediately to save time
+    if len(legal_action_ids) == 1:
+        return list(ID_TO_ACTION[legal_action_ids[0]])
+
+    # 1. Compute Policy Softmax at the current state (Root)
+    root_obs = state_to_observation(st, my_idx)
+    root_obs_t = torch.tensor(root_obs, dtype=torch.float32).unsqueeze(0)
+    
+    with torch.no_grad():
+        root_outputs = model(root_obs_t)
+        root_logits = root_outputs['policy'].squeeze(0).numpy()
+        
+    masked_logits = np.ones_like(root_logits) * -1e32
+    masked_logits[legal_action_ids] = root_logits[legal_action_ids]
+    exp_logits = np.exp(masked_logits - np.max(masked_logits[legal_action_ids]))
+    policy_probs = exp_logits / np.sum(exp_logits)
+
+    opp_idx = 1 - my_idx
+    accum_scores = {aid: 0.0 for aid in legal_action_ids}
+    sim_counts = {aid: 0 for aid in legal_action_ids}
+
+    start_time = time.time()
+    runs = 0
+
+    while time.time() - start_time < think_time:
+        # 1-1. Sample state
+        env = sample_environment(st, my_idx, known_stones)
+
+        # 1-2. Predict opponent's action (Stochastic Sampling from opponent's policy)
+        opp_obs = env.observation(opp_idx)
+        opp_obs_t = torch.tensor(opp_obs, dtype=torch.float32).unsqueeze(0)
+
+        with torch.no_grad():
+            opp_outputs = model(opp_obs_t)
+            opp_logits = opp_outputs['policy'].squeeze(0).numpy()
+
+        opp_legal = env.legal_actions(opp_idx)
+        if not opp_legal:
+            opp_action_id = ACTION_TO_ID[()]  # empty bid
+        else:
+            opp_masked = np.ones_like(opp_logits) * -1e32
+            opp_masked[opp_legal] = opp_logits[opp_legal]
+            opp_exp = np.exp(opp_masked - np.max(opp_masked[opp_legal]))
+            opp_probs = opp_exp / np.sum(opp_exp)
+            
+            # Stochastic Choice
+            choices = np.arange(len(opp_legal))
+            probs_subset = opp_probs[opp_legal]
+            probs_subset = probs_subset / np.sum(probs_subset)  # re-normalize for rounding errors
+            sampled_idx = np.random.choice(choices, p=probs_subset)
+            opp_action_id = opp_legal[sampled_idx]
+
+        # 1-3. Simulate all my legal actions in parallel (batched inference)
+        sim_envs = []
+        for my_action_id in legal_action_ids:
+            sim_env = clone_env(env)
+            sim_env.play(my_action_id, my_idx)
+            sim_env.play(opp_action_id, opp_idx)
+            sim_envs.append(sim_env)
+
+        # Prepare batch observations
+        obs_list = [sim_env.observation(my_idx) for sim_env in sim_envs]
+        obs_batch = torch.tensor(np.array(obs_list), dtype=torch.float32)
+
+        with torch.no_grad():
+            sim_outputs = model(obs_batch)
+            values = sim_outputs['value'].squeeze(1).numpy()
+
+        # Accumulate results
+        for i, my_action_id in enumerate(legal_action_ids):
+            val = values[i]
+            sim_env = sim_envs[i]
+            if sim_env.terminal():
+                outcome = sim_env.outcome()
+                val = outcome[my_idx] * 2.0  # boost final outcome signal
+
+            accum_scores[my_action_id] += val
+            sim_counts[my_action_id] += 1
+
+        runs += 1
+
+    # 4. Hybrid Score Selection Formula: Score = PolicyProb + WEIGHT * AverageValue
+    best_action_id = None
+    best_score = -999.0
+    best_avg_val = 0.0
+    for aid in legal_action_ids:
+        if sim_counts[aid] > 0:
+            avg_val = accum_scores[aid] / sim_counts[aid]
+            score = policy_probs[aid] + WEIGHT * avg_val
+            if score > best_score:
+                best_score = score
+                best_avg_val = avg_val
+                best_action_id = aid
+
+    if best_action_id is None:
+        best_action_id = legal_action_ids[0]
+
+    best_action_tuple = ID_TO_ACTION[best_action_id]
+    print(f"[AI] Search stats: simulations={runs}, root_prob={policy_probs[best_action_id]:.4f}, "
+          f"sim_val={best_avg_val:.4f}, score={best_score:.4f}, choice={best_action_tuple}")
+    return list(best_action_tuple)
+
+
 async def do_submit_bid(st: Dict[str, Any], reason: str):
     if model is None:
         print("[AI] Error: Model is not loaded!")
         return
-        
-    hand = my_hand(st)
-    offer = safe_list(st.get("offer"))
-    
-    # 1. Translate state to network observation representation
-    obs = state_to_observation(st, my_index)
-    obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
-    
-    # 2. Model inference
-    with torch.no_grad():
-        outputs = model(obs_t)
-        policy_logits = outputs['policy'].squeeze(0).numpy()
-        
-    # 3. Mask illegal actions
-    legal_indices = get_legal_actions(hand, offer)
-            
-    if not legal_indices:
-        # Fallback to empty bid if somehow no actions are legal (should not happen as empty is always legal)
-        bid = []
-    else:
-        # Set illegal action logits to a very low value
-        masked_logits = np.ones_like(policy_logits) * -1e32
-        masked_logits[legal_indices] = policy_logits[legal_indices]
-        
-        best_action_id = np.argmax(masked_logits)
-        best_action_tuple = ID_TO_ACTION[best_action_id]
-        bid = list(best_action_tuple)
 
-    await asyncio.sleep(THINK_DELAY)
+    # Call the hybrid lookahead search
+    bid = select_action_with_search(st, my_index, THINK_TIME)
+
+    # Throttled send
     await _emit_throttled("submit_bid", {"room_id": cfg["room"], "stones": bid})
     print(f"[AI] submit ({reason}) stones={bid}")
 
@@ -281,7 +483,8 @@ async def do_ok_next(st: Dict[str, Any], reason: str):
         _ok_sent_key = key
         return
 
-    await asyncio.sleep(THINK_DELAY)
+    # 0.05s delay to avoid instantaneous clicks
+    await asyncio.sleep(0.05)
     await _emit_throttled("proceed_phase", {"room_id": cfg["room"]})
     _ok_sent_key = key
     print(f"[AI] OK/Next ({reason})")
@@ -354,14 +557,16 @@ async def bid_rejected(data):
 # ============ main ============
 
 async def main():
-    global AUTO_NEXT, model
+    global AUTO_NEXT, model, THINK_TIME, WEIGHT
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8765")
     ap.add_argument("--room", default="room1")
-    ap.add_argument("--name", default="AI_HandyRL")
-    ap.add_argument("--model", default="models/latest.pth", help="Path to HandyRL trained model pth")
+    ap.add_argument("--name", default="AI_HandyRL_V3")
+    ap.add_argument("--model", default="better-model.pth", help="Path to HandyRL trained model pth")
     ap.add_argument("--auto-next", type=int, default=1, help="1=auto OK/Next in RESULT/ROUND_END, 0=disable")
+    ap.add_argument("--think-time", type=float, default=0.2, help="Thinking time budget in seconds")
+    ap.add_argument("--weight", type=float, default=0.5, help="Weight for simulation value (default 0.5)")
     args = ap.parse_args()
 
     cfg["url"] = args.url
@@ -369,6 +574,8 @@ async def main():
     cfg["name"] = args.name
 
     AUTO_NEXT = bool(args.auto_next)
+    THINK_TIME = args.think_time
+    WEIGHT = args.weight
 
     # Initialize and load model weights
     print(f"Loading HandyRL model from {args.model}...")

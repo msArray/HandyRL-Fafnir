@@ -36,7 +36,8 @@ def generate_action_map(max_size=5):
     id_to_action = {i: comb for i, comb in enumerate(actions)}
     return action_to_id, id_to_action
 
-ACTION_TO_ID, ID_TO_ACTION = generate_action_map(5)
+ACTION_TO_ID, ID_TO_ACTION = generate_action_map(8)
+NUM_ACTIONS = len(ID_TO_ACTION)
 
 # =========================
 # Numba Accelerated Helpers
@@ -45,17 +46,18 @@ from numba import njit
 
 COLOR_TO_INT = {c: i for i, c in enumerate(COLORS_ALL)}
 
-# Precompute color counts for all 462 actions (shape: 462, 6)
-ACTION_COUNTS = np.zeros((462, 6), dtype=np.int32)
-for i in range(462):
+# Precompute color counts for all actions (shape: NUM_ACTIONS, 6)
+ACTION_COUNTS = np.zeros((NUM_ACTIONS, 6), dtype=np.int32)
+for i in range(NUM_ACTIONS):
     action_tuple = ID_TO_ACTION[i]
     for color in action_tuple:
         ACTION_COUNTS[i, COLOR_TO_INT[color]] += 1
 
 @njit(cache=True)
 def get_legal_actions_numba(action_counts_matrix, hand_counts, offer_counts):
+    n_actions = action_counts_matrix.shape[0]
     n_legal = 0
-    for i in range(462):
+    for i in range(n_actions):
         # 1. Check offer collision
         collision = False
         for c in range(6):
@@ -76,7 +78,7 @@ def get_legal_actions_numba(action_counts_matrix, hand_counts, offer_counts):
             
     legal_ids = np.empty(n_legal, dtype=np.int32)
     idx = 0
-    for i in range(462):
+    for i in range(n_actions):
         collision = False
         for c in range(6):
             if action_counts_matrix[i, c] > 0 and offer_counts[c] > 0:
@@ -128,8 +130,8 @@ class FafnirModel(nn.Module):
         self.fc2 = nn.Linear(128, 128)
         self.fc3 = nn.Linear(128, 128)
         
-        # Policy output: 462 actions
-        self.policy_head = nn.Linear(128, 462)
+        # Policy output: NUM_ACTIONS actions
+        self.policy_head = nn.Linear(128, NUM_ACTIONS)
         # Value output: 1 scalar
         self.value_head = nn.Linear(128, 1)
 
