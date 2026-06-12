@@ -6,6 +6,7 @@ import sys
 import os
 import time
 import copy
+import itertools
 from typing import Any, Dict, List, Optional
 
 # Add workspace root to sys.path so we can import fafnir_env
@@ -13,11 +14,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import socketio
 
 from fafnir_env import (
     Environment,
-    FafnirModel,
     ID_TO_ACTION,
     ACTION_TO_ID,
     COLORS,
@@ -36,8 +38,33 @@ known_stones = [{c: 0 for c in COLORS_ALL}, {c: 0 for c in COLORS_ALL}]
 known_round: Optional[int] = None
 known_result_key: Optional[str] = None
 
-# AI neural network model
-model: Optional[FafnirModel] = None
+# Action space dynamic mapping placeholders
+ACTION_TO_ID_CUSTOM = {}
+ID_TO_ACTION_CUSTOM = {}
+NUM_ACTIONS = 3003
+FEATURES_DIM = 34
+
+
+class FafnirModelCustom(nn.Module):
+    def __init__(self, obs_size=34, num_actions=3003):
+        super().__init__()
+        self.fc1 = nn.Linear(obs_size, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.fc3 = nn.Linear(128, 128)
+        self.policy_head = nn.Linear(128, num_actions)
+        self.value_head = nn.Linear(128, 1)
+
+    def forward(self, x, hidden=None):
+        h = F.relu(self.fc1(x))
+        h = F.relu(self.fc2(h))
+        h = F.relu(self.fc3(h))
+        policy = self.policy_head(h)
+        value = torch.tanh(self.value_head(h))
+        return {'policy': policy, 'value': value}
+
+
+# AI neural network model placeholder
+model: Optional[FafnirModelCustom] = None
 
 # anti-spam
 _action_lock = asyncio.Lock()
@@ -69,6 +96,17 @@ def count_stones(stones: List[Any]) -> Dict[str, int]:
         if s in counts:
             counts[s] += 1
     return counts
+
+
+def setup_action_space(max_bid_size: int):
+    global ACTION_TO_ID_CUSTOM, ID_TO_ACTION_CUSTOM, NUM_ACTIONS
+    actions = []
+    for r in range(max_bid_size + 1):
+        for comb in itertools.combinations_with_replacement(COLORS_ALL, r):
+            actions.append(comb)
+    ACTION_TO_ID_CUSTOM = {comb: i for i, comb in enumerate(actions)}
+    ID_TO_ACTION_CUSTOM = {i: comb for i, comb in enumerate(actions)}
+    NUM_ACTIONS = len(ID_TO_ACTION_CUSTOM)
 
 
 def public_potential_score(hand: List[str], opponent_known: Dict[str, int]) -> int:
@@ -314,15 +352,12 @@ def clone_env(env: Environment) -> Environment:
 
 
 def state_to_observation(st: Dict[str, Any], my_idx: int) -> np.ndarray:
-    # Extract details safely
     hand = my_hand(st)
     my_hand_counts = [hand.count(c) / float(STONE_COUNT[c]) for c in COLORS_ALL]
     
     opp_idx = 1 - my_idx
     ps = players_of(st)
     opp_hand_size = ps[opp_idx].get("hand_count", 0) if opp_idx < len(ps) else 0
-    opp_known = known_stones[opp_idx]
-    my_known = known_stones[my_idx]
     
     offer = safe_list(st.get("offer"))
     offer_counts = [offer.count(c) / 10.0 for c in COLORS_ALL]
@@ -331,36 +366,69 @@ def state_to_observation(st: Dict[str, Any], my_idx: int) -> np.ndarray:
     trash_counts = [trash.get(c, 0) for c in COLORS_ALL]
     
     bag_size = st.get("bag_left", 0)
-
     is_caretaker = 1.0 if st.get("caretaker", 0) == my_idx else 0.0
-    opp_unknown_size = max(0, int(opp_hand_size or 0) - sum(opp_known.values()))
-    potential_score = public_potential_score(hand, opp_known)
-    
-    features = (
-        my_hand_counts + 
-        offer_counts + 
-        [tc / 6.0 for tc in trash_counts] + 
-        [opp_known[c] / float(STONE_COUNT[c]) for c in COLORS_ALL] +
-        [opp_unknown_size / 20.0] +
-        [my_known[c] / float(STONE_COUNT[c]) for c in COLORS_ALL] +
-        [bag_size / 80.0, 
-         is_caretaker, 
-         (potential_score + 15.0) / 75.0]
-    )
-    return np.clip(np.array(features, dtype=np.float32), 0.0, 1.0)
+
+    if FEATURES_DIM == 26:
+        # Legacy 26-dimensional feature representation
+        my_score = ps[my_idx].get("score", 0) if my_idx < len(ps) else 0
+        opp_score = ps[opp_idx].get("score", 0) if opp_idx < len(ps) else 0
+        is_p0 = 1.0 if my_idx == 0 else 0.0
+        turn_num = st.get("turn", 1)
+        round_num = st.get("round", 1)
+        
+        my_hand_counts_raw = [hand.count(c) for c in COLORS_ALL]
+        offer_counts_raw = [offer.count(c) for c in COLORS_ALL]
+        trash_counts_raw = [trash.get(c, 0) for c in COLORS_ALL]
+        
+        features = (
+            my_hand_counts_raw + 
+            [opp_hand_size / 20.0] + 
+            offer_counts_raw + 
+            [tc / 6.0 for tc in trash_counts_raw] + 
+            [bag_size / 80.0, 
+             my_score / 40.0, 
+             opp_score / 40.0, 
+             is_caretaker, 
+             is_p0, 
+             turn_num / 20.0, 
+             round_num / 10.0]
+        )
+        return np.array(features, dtype=np.float32)
+    else:
+        # Current 34-dimensional feature representation
+        opp_known = known_stones[opp_idx]
+        my_known = known_stones[my_idx]
+        opp_unknown_size = max(0, int(opp_hand_size or 0) - sum(opp_known.values()))
+        potential_score = public_potential_score(hand, opp_known)
+        
+        features = (
+            my_hand_counts + 
+            offer_counts + 
+            [tc / 6.0 for tc in trash_counts] + 
+            [opp_known[c] / float(STONE_COUNT[c]) for c in COLORS_ALL] +
+            [opp_unknown_size / 20.0] +
+            [my_known[c] / float(STONE_COUNT[c]) for c in COLORS_ALL] +
+            [bag_size / 80.0, 
+             is_caretaker, 
+             (potential_score + 15.0) / 75.0]
+        )
+        return np.clip(np.array(features, dtype=np.float32), 0.0, 1.0)
 
 
 def select_action_with_search(st: Dict[str, Any], my_idx: int, think_time: float) -> List[str]:
     hand = my_hand(st)
     offer = safe_list(st.get("offer"))
-    legal_action_ids = get_legal_actions(hand, offer)
+    legal_action_ids_raw = get_legal_actions(hand, offer)
+
+    # Filter action IDs that are valid under the bot's custom action space
+    legal_action_ids = [aid for aid in legal_action_ids_raw if aid < NUM_ACTIONS]
 
     if not legal_action_ids:
         return []
 
     # If only one legal move exists, return it immediately to save time
     if len(legal_action_ids) == 1:
-        return list(ID_TO_ACTION[legal_action_ids[0]])
+        return list(ID_TO_ACTION_CUSTOM[legal_action_ids[0]])
 
     # 1. Compute Policy Softmax at the current state (Root)
     root_obs = state_to_observation(st, my_idx)
@@ -394,9 +462,12 @@ def select_action_with_search(st: Dict[str, Any], my_idx: int, think_time: float
             opp_outputs = model(opp_obs_t)
             opp_logits = opp_outputs['policy'].squeeze(0).numpy()
 
-        opp_legal = env.legal_actions(opp_idx)
+        opp_legal_raw = env.legal_actions(opp_idx)
+        # Filter opponent's moves to be compatible with this model size
+        opp_legal = [aid for aid in opp_legal_raw if aid < NUM_ACTIONS]
+
         if not opp_legal:
-            opp_action_id = ACTION_TO_ID[()]  # empty bid
+            opp_action_id = ACTION_TO_ID.get((), 0)  # fallback
         else:
             opp_masked = np.ones_like(opp_logits) * -1e32
             opp_masked[opp_legal] = opp_logits[opp_legal]
@@ -406,7 +477,7 @@ def select_action_with_search(st: Dict[str, Any], my_idx: int, think_time: float
             # Stochastic Choice
             choices = np.arange(len(opp_legal))
             probs_subset = opp_probs[opp_legal]
-            probs_subset = probs_subset / np.sum(probs_subset)  # re-normalize for rounding errors
+            probs_subset = probs_subset / np.sum(probs_subset)
             sampled_idx = np.random.choice(choices, p=probs_subset)
             opp_action_id = opp_legal[sampled_idx]
 
@@ -414,8 +485,16 @@ def select_action_with_search(st: Dict[str, Any], my_idx: int, think_time: float
         sim_envs = []
         for my_action_id in legal_action_ids:
             sim_env = clone_env(env)
-            sim_env.play(my_action_id, my_idx)
-            sim_env.play(opp_action_id, opp_idx)
+            # Map dynamic ID to server-level action tuple, then play
+            action_tuple = ID_TO_ACTION_CUSTOM[my_action_id]
+            server_my_action_id = ACTION_TO_ID[action_tuple]
+            
+            # Convert opponent custom ID to server ID
+            opp_action_tuple = ID_TO_ACTION_CUSTOM[opp_action_id]
+            server_opp_action_id = ACTION_TO_ID[opp_action_tuple]
+            
+            sim_env.play(server_my_action_id, my_idx)
+            sim_env.play(server_opp_action_id, opp_idx)
             sim_envs.append(sim_env)
 
         # Prepare batch observations
@@ -455,7 +534,7 @@ def select_action_with_search(st: Dict[str, Any], my_idx: int, think_time: float
     if best_action_id is None:
         best_action_id = legal_action_ids[0]
 
-    best_action_tuple = ID_TO_ACTION[best_action_id]
+    best_action_tuple = ID_TO_ACTION_CUSTOM[best_action_id]
     print(f"[AI] Search stats: simulations={runs}, root_prob={policy_probs[best_action_id]:.4f}, "
           f"sim_val={best_avg_val:.4f}, score={best_score:.4f}, choice={best_action_tuple}")
     return list(best_action_tuple)
@@ -557,7 +636,7 @@ async def bid_rejected(data):
 # ============ main ============
 
 async def main():
-    global AUTO_NEXT, model, THINK_TIME, WEIGHT
+    global AUTO_NEXT, model, THINK_TIME, WEIGHT, FEATURES_DIM
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8765")
@@ -567,6 +646,8 @@ async def main():
     ap.add_argument("--auto-next", type=int, default=1, help="1=auto OK/Next in RESULT/ROUND_END, 0=disable")
     ap.add_argument("--think-time", type=float, default=0.2, help="Thinking time budget in seconds")
     ap.add_argument("--weight", type=float, default=0.5, help="Weight for simulation value (default 0.5)")
+    ap.add_argument("--max-bid-size", type=int, default=8, help="Bidding range size limit (e.g. 5 or 8)")
+    ap.add_argument("--features-dim", type=int, default=34, help="Features size input dimension (26 or 34)")
     args = ap.parse_args()
 
     cfg["url"] = args.url
@@ -576,10 +657,15 @@ async def main():
     AUTO_NEXT = bool(args.auto_next)
     THINK_TIME = args.think_time
     WEIGHT = args.weight
+    FEATURES_DIM = args.features_dim
+
+    # Setup local customized action space
+    setup_action_space(args.max_bid_size)
+    print(f"Configured action space with limit={args.max_bid_size} (NUM_ACTIONS={NUM_ACTIONS})")
 
     # Initialize and load model weights
     print(f"Loading HandyRL model from {args.model}...")
-    model = FafnirModel()
+    model = FafnirModelCustom(obs_size=FEATURES_DIM, num_actions=NUM_ACTIONS)
     try:
         model.load_state_dict(torch.load(args.model, map_location=torch.device('cpu')), strict=False)
         model.eval()
